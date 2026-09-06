@@ -2960,11 +2960,13 @@ select.param-inp{
 #taModalHL{position:absolute;inset:16px;margin:0;padding:14px;border:1px solid transparent;font-family:var(--mono);line-height:1.7;box-sizing:border-box;white-space:pre-wrap;word-break:break-word;overflow:hidden;pointer-events:none;color:var(--t1);border-radius:3px;z-index:0;}
 #taModalTa{position:relative;z-index:1;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:var(--t1)!important;}
 #taModalHL .nw-token{font-weight:700;}
+#taModalHL .nw-slotmeta{font-weight:700;color:var(--acc);}
 #taModalHL .nw-miss{color:#ff5a5a;-webkit-text-fill-color:#ff5a5a;}
 .nw-hl-wrap{position:relative;display:flex;flex-direction:column;min-height:0;}
 .nw-hl-mirror{position:absolute;top:0;left:0;right:0;bottom:0;margin:0;overflow:hidden;pointer-events:none;white-space:pre-wrap;word-break:break-word;box-sizing:border-box;z-index:0;border-color:transparent!important;color:var(--t1);}
 .nw-hl-host{position:relative;z-index:1;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:var(--t1)!important;}
 .nw-hl-mirror .nw-token{font-weight:700;}
+.nw-hl-mirror .nw-slotmeta{font-weight:700;color:var(--acc);}
 .nw-hl-mirror .nw-miss{color:#ff5a5a;-webkit-text-fill-color:#ff5a5a;}
 #taModalFooter{padding:10px 14px;border-top:1px solid var(--b1);display:flex;gap:8px;justify-content:flex-end;flex-shrink:0;}
 /* 삽입 버튼 패널 */
@@ -6188,14 +6190,176 @@ function buildFullPrompt(snap){
    - 매 호출마다 새로 굴림 (같은 시드라도 randomizer 결과 매번 바뀜 — NAI 공식 동작 일치)
    - 캐릭 multi-character 의 | 구분자와 충돌 X (외곽 || 패턴이 다름)
 */
+const _NAIM_GROUP_TOKEN_RE = /[ \t]*,?[ \t]*\n?[ \t]*\.\.([^.\n][^\n]*?)\.\.[ \t]*\n?/g;
+const _NAIM_TOKEN_RE = /\.\.([^.\n][^\n]*?)\.\./g;
+const _NAIM_SLOTS_PREFIX = '[slots:';
+const _NAIM_MAX_CHAR_SLOTS = 6;
+function _makeWildcardExpansionContext(){
+  return { slotAdditions: Array.from({length:_NAIM_MAX_CHAR_SLOTS}, ()=>[]) };
+}
+function _queueSlotAddition(ctx, slotIndex, text){
+  if(!ctx || !Array.isArray(ctx.slotAdditions)) return;
+  if(!Number.isInteger(slotIndex) || slotIndex < 0 || slotIndex >= ctx.slotAdditions.length) return;
+  const clean = String(text == null ? '' : text).trim();
+  if(!clean) return;
+  ctx.slotAdditions[slotIndex].push(clean);
+}
+function _trimPromptCommaEdges(text){
+  return String(text == null ? '' : text).replace(/^\s*,+\s*|\s*,+\s*$/g, '').trim();
+}
+function _mergePromptFragments(existing, injected){
+  const left = _trimPromptCommaEdges(existing);
+  const right = _trimPromptCommaEdges(injected);
+  if(!left) return right;
+  if(!right) return left;
+  return left + ', ' + right;
+}
+function _findUnescapedChar(text, needle, fromIndex){
+  const src = String(text == null ? '' : text);
+  for(let i = Math.max(0, fromIndex || 0); i < src.length; i++){
+    if(src[i] !== needle) continue;
+    let slashCount = 0;
+    for(let j = i - 1; j >= 0 && src[j] === '\\'; j--) slashCount++;
+    if((slashCount % 2) === 0) return i;
+  }
+  return -1;
+}
+function _splitEscaped(text, sep){
+  const out = [];
+  let buf = '';
+  const src = String(text == null ? '' : text);
+  for(let i = 0; i < src.length; i++){
+    const ch = src[i];
+    if(ch === '\\' && i + 1 < src.length){
+      buf += ch + src[++i];
+      continue;
+    }
+    if(ch === sep){
+      out.push(buf);
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  out.push(buf);
+  return out;
+}
+function _unescapeSlotsValue(text){
+  return String(text == null ? '' : text).replace(/\\([\\|\]])/g, '$1');
+}
+function _stripWildcardSlotsDirective(text, ctx){
+  const src = String(text == null ? '' : text);
+  const lower = src.toLowerCase();
+  const start = lower.lastIndexOf(_NAIM_SLOTS_PREFIX);
+  if(start < 0) return { text: src, parsed: false };
+  const close = _findUnescapedChar(src, ']', start + _NAIM_SLOTS_PREFIX.length);
+  if(close < 0) return { text: src, parsed: false };
+  if(src.slice(close + 1).trim()) return { text: src, parsed: false };
+  const body = src.slice(start + _NAIM_SLOTS_PREFIX.length, close);
+  const parts = _splitEscaped(body, '|');
+  if(parts.length === 0) return { text: src, parsed: false };
+  const parsed = [];
+  for(const rawPart of parts){
+    const part = String(rawPart == null ? '' : rawPart).trim();
+    if(!part) return { text: src, parsed: false };
+    const eqIdx = _findUnescapedChar(part, '=', 0);
+    if(eqIdx <= 0) return { text: src, parsed: false };
+    const slotNum = String(part.slice(0, eqIdx)).trim();
+    if(!/^\d+$/.test(slotNum)) return { text: src, parsed: false };
+    parsed.push({
+      slotIndex: parseInt(slotNum, 10) - 1,
+      value: _unescapeSlotsValue(part.slice(eqIdx + 1))
+    });
+  }
+  if(ctx) parsed.forEach(p => _queueSlotAddition(ctx, p.slotIndex, p.value));
+  return {
+    text: src.slice(0, start).replace(/[ \t]+$/, ''),
+    parsed: true
+  };
+}
+function _expandQueuedSlotAdditions(ctx, applyWildcards){
+  const resolved = Array.from({length:_NAIM_MAX_CHAR_SLOTS}, ()=>[]);
+  if(!ctx || !Array.isArray(ctx.slotAdditions)) return resolved;
+  const pending = [];
+  ctx.slotAdditions.forEach((arr, slotIndex) => {
+    (Array.isArray(arr) ? arr : []).forEach(text => pending.push({ slotIndex, text }));
+  });
+  let guard = 0;
+  while(pending.length && guard < 200){
+    guard++;
+    const cur = pending.shift();
+    let text = typeof cur.text === 'string' ? cur.text : String(cur.text == null ? '' : cur.text);
+    const nestedCtx = _makeWildcardExpansionContext();
+    if(applyWildcards) text = expandGroupTokens(text, nestedCtx);
+    text = expandWildcards(text);
+    const clean = _trimPromptCommaEdges(text);
+    if(clean) resolved[cur.slotIndex].push(clean);
+    nestedCtx.slotAdditions.forEach((arr, slotIndex) => {
+      (Array.isArray(arr) ? arr : []).forEach(nested => pending.push({ slotIndex, text: nested }));
+    });
+  }
+  if(guard >= 200 && typeof console !== 'undefined'){
+    console.warn('[wildcard] slot directive expansion truncated (possible recursive wildcard loop)');
+  }
+  return resolved;
+}
+function _applyWildcardSlotAdditionsToChars(payload, ctx, applyWildcards){
+  if(!payload || !Array.isArray(payload.chars)) return;
+  const additions = _expandQueuedSlotAdditions(ctx, applyWildcards);
+  additions.forEach((parts, slotIndex) => {
+    if(!parts || parts.length === 0) return;
+    const ch = payload.chars[slotIndex];
+    if(!ch || !ch.enabled) return;
+    ch.prompt = _mergePromptFragments(ch.prompt || '', parts.join(', '));
+  });
+}
+function _runWildcardInlineSlotsSelfTest(){
+  const makeCtx = () => ({ slotAdditions: Array.from({length:_NAIM_MAX_CHAR_SLOTS}, ()=>[]) });
+  const tests = [
+    ['legacy unchanged', ()=>{
+      const ctx = makeCtx();
+      const out = _stripWildcardSlotsDirective('black hair,', ctx);
+      return out.text === 'black hair,' && ctx.slotAdditions.every(arr => arr.length === 0);
+    }],
+    ['directive strips and routes', ()=>{
+      const ctx = makeCtx();
+      const out = _stripWildcardSlotsDirective('pat head [slots:1=head pat|2=happy]', ctx);
+      return out.text === 'pat head' &&
+        (ctx.slotAdditions[0] || []).join('|') === 'head pat' &&
+        (ctx.slotAdditions[1] || []).join('|') === 'happy';
+    }],
+    ['repeated slot preserves order', ()=>{
+      const ctx = makeCtx();
+      _stripWildcardSlotsDirective('pose [slots:1=tag a|1=tag b]', ctx);
+      return (ctx.slotAdditions[0] || []).join('|') === 'tag a|tag b';
+    }],
+    ['malformed preserved', ()=>{
+      const ctx = makeCtx();
+      const raw = 'pose [slots:1=tag a|oops]';
+      const out = _stripWildcardSlotsDirective(raw, ctx);
+      return out.text === raw && ctx.slotAdditions.every(arr => arr.length === 0);
+    }],
+    ['merge trims commas', ()=>{
+      return _mergePromptFragments('foo, ', ' , bar ') === 'foo, bar' &&
+        _mergePromptFragments('', ' bar ') === 'bar' &&
+        _mergePromptFragments('foo', '') === 'foo';
+    }]
+  ];
+  const failed = tests.filter(t => !t[1]()).map(t => t[0]);
+  if(failed.length){
+    throw new Error('wildcard inline slot self-test failed: ' + failed.join(', '));
+  }
+  return true;
+}
+
 // Phase 147/149 — ..N.. 와일드카드 그룹 토큰 + ..카드이름.. 카드 토큰 펼치기 (NAI 전송 직전, UI 텍스트 불변).
 //   ..1.. → 그룹1 fresh roll. ..눈색.. → "눈색" 카드 pool 에서 랜덤 1개. 같은 토큰 여러 개도 각자 독립 랜덤.
 //   가독성: 토큰 앞 공백/줄바꿈 정리하되 사용자가 찍은 쉼표는 보존, 그룹 결과는 빈 줄로 감싸 분리.
-function expandGroupTokens(text){
+function expandGroupTokens(text, ctx){
   if(typeof text !== 'string' || !text) return text;
   if(text.indexOf('..') === -1) return text;
   // ..토큰.. : 안쪽은 숫자(그룹) 또는 그 외 문자(카드 이름). 줄바꿈/.. 자체는 토큰 내용에서 제외.
-  return text.replace(/[ \t]*,?[ \t]*\n?[ \t]*\.\.([^.\n][^\n]*?)\.\.[ \t]*\n?/g, (match, inner)=>{
+  return text.replace(_NAIM_GROUP_TOKEN_RE, (match, inner)=>{
     const token = String(inner).trim();
     const hadComma = /,/.test(match);
     if(/^\d+$/.test(token)){
@@ -6207,6 +6371,7 @@ function expandGroupTokens(text){
           expanded = NAIMWildcard.expandGroupByIndex(n) || '';
         }
       }catch(e){}
+      expanded = _stripWildcardSlotsDirective(expanded, ctx).text;
       const lead = hadComma ? ',\n\n' : '\n\n';
       if(!expanded) return lead;
       return lead + expanded + '\n\n';
@@ -6218,6 +6383,7 @@ function expandGroupTokens(text){
           expanded = NAIMWildcard.expandCardByName(token) || '';
         }
       }catch(e){}
+      expanded = _stripWildcardSlotsDirective(expanded, ctx).text;
       const lead = hadComma ? ', ' : ' ';
       if(!expanded) return lead;  // 못 찾으면 자리만 띄움
       return lead + expanded + ' ';
@@ -10691,8 +10857,9 @@ function toggleVariety(){
         const _wcApply = item.payload && typeof item.payload.wildcardApplyEnabled === 'boolean'
           ? item.payload.wildcardApplyEnabled
           : _wildcardApplyEnabled;
+        const _wcCtx = _makeWildcardExpansionContext();
         if(_wcApply){
-          userPrompt = expandGroupTokens(userPrompt);
+          userPrompt = expandGroupTokens(userPrompt, _wcCtx);
         }
         userPrompt = expandWildcards(userPrompt);
         if(item.payload){
@@ -10701,6 +10868,7 @@ function toggleVariety(){
             item.payload.negPrompt = expandWildcards(item.payload.negPrompt);
           }
           if(Array.isArray(item.payload.chars)){
+            if(_wcApply) _applyWildcardSlotAdditionsToChars(item.payload, _wcCtx, true);
             item.payload.chars.forEach(c => {
               if(c && typeof c.prompt === 'string'){
                 if(_wcApply) c.prompt = expandGroupTokens(c.prompt);
@@ -14303,22 +14471,43 @@ function _naimTokenMiss(inner){
 function _hlEscape(x){
   return x.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+function _renderPromptHighlightHTML(text){
+  const src = String(text == null ? '' : text);
+  const ranges = [];
+  let m;
+  _NAIM_TOKEN_RE.lastIndex = 0;
+  while((m = _NAIM_TOKEN_RE.exec(src)) !== null){
+    ranges.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      cls: _naimTokenMiss(m[1]) ? 'nw-token nw-miss' : 'nw-token'
+    });
+  }
+  const SLOT_RE = /\[slots:(?:\\.|[^\]])*\]/gi;
+  while((m = SLOT_RE.exec(src)) !== null){
+    ranges.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      cls: 'nw-slotmeta'
+    });
+  }
+  ranges.sort((a,b)=>a.start - b.start || a.end - b.end);
+  let out = '', last = 0;
+  ranges.forEach(r => {
+    if(r.start < last) return;
+    out += _hlEscape(src.slice(last, r.start));
+    out += '<span class="' + r.cls + '">' + _hlEscape(src.slice(r.start, r.end)) + '</span>';
+    last = r.end;
+  });
+  out += _hlEscape(src.slice(last));
+  return out + '\n';
+}
 function renderTaHighlight(){
   var ta = document.getElementById('taModalTa');
   var hl = document.getElementById('taModalHL');
   if(!ta || !hl) return;
   hl.style.fontSize = ta.style.fontSize || '';
-  var TOKEN_RE = /\.\.([^.\n][^\n]*?)\.\./g;
-  var out = '', last = 0, m;
-  var v = ta.value;
-  while((m = TOKEN_RE.exec(v)) !== null){
-    out += _hlEscape(v.slice(last, m.index));
-    var cls = _naimTokenMiss(m[1]) ? 'nw-token nw-miss' : 'nw-token';
-    out += '<span class="' + cls + '">' + _hlEscape(m[0]) + '</span>';
-    last = m.index + m[0].length;
-  }
-  out += _hlEscape(v.slice(last));
-  hl.innerHTML = out + '\n';
+  hl.innerHTML = _renderPromptHighlightHTML(ta.value);
   hl.scrollTop = ta.scrollTop;
   hl.scrollLeft = ta.scrollLeft;
 }
@@ -14339,16 +14528,7 @@ function _nwRenderOverlay(ta){
   var mir = ta._nwMirror;
   if(!mir) return;
   _nwSyncMirrorStyle(ta, mir);
-  var TOKEN_RE = /\.\.([^.\n][^\n]*?)\.\./g;
-  var out = '', last = 0, m, v = ta.value;
-  while((m = TOKEN_RE.exec(v)) !== null){
-    out += _hlEscape(v.slice(last, m.index));
-    var cls = _naimTokenMiss(m[1]) ? 'nw-token nw-miss' : 'nw-token';
-    out += '<span class="' + cls + '">' + _hlEscape(m[0]) + '</span>';
-    last = m.index + m[0].length;
-  }
-  out += _hlEscape(v.slice(last));
-  mir.innerHTML = out + '\n';
+  mir.innerHTML = _renderPromptHighlightHTML(ta.value);
   mir.scrollTop = ta.scrollTop;
   mir.scrollLeft = ta.scrollLeft;
 }
@@ -18509,7 +18689,8 @@ const NAIMWildcard = (function(){
           <option value="other"${curCat==='other'?' selected':''}>기타</option>
         </select>
         <input class="nw-modal-input" id="nw-cc-name" type="text" placeholder="카드 이름 (필수·중복 불가)" value="${curName.replace(/"/g,'&quot;')}">
-        <textarea class="nw-modal-input" id="nw-cc-pool" placeholder="태그를 한 줄에 하나씩 입력&#10;예:&#10;cat,&#10;dog,&#10;rabbit,">${curPool.replace(/</g,'&lt;')}</textarea>
+        <textarea class="nw-modal-input" id="nw-cc-pool" placeholder="태그를 한 줄에 하나씩 입력&#10;예:&#10;cat,&#10;dog,&#10;A character gently pats another character&apos;s head. [slots:1=head pat, hand on head|2=being patted, happy]">${curPool.replace(/</g,'&lt;')}</textarea>
+        <div style="font-size:11px;color:var(--t3);margin-top:6px;line-height:1.45;">각 줄 끝에 <span style="color:var(--acc);font-family:var(--mono);">[slots:1=...|2=...]</span> 를 붙이면, 그 줄이 뽑혔을 때 C1~C6 프롬프트에 태그를 임시로 추가합니다. 저장 데이터와 화면 입력칸은 바뀌지 않습니다.</div>
         <div class="nw-modal-foot">
           ${editing ? '<button class="nw-modal-btn" data-act="del" style="margin-right:auto;color:#ff6b6b;">삭제</button>' : ''}
           <button class="nw-modal-btn" data-act="cancel">취소</button>
@@ -20153,7 +20334,7 @@ body.tour-mob #tourNavBtns{display:none;}
       },
       {
         key:'deck.groups', target:'nw-groups-area', title:'와일드카드 사용 방법',
-        text:'이 화면에서 후보 목록을 만들어 둡니다.\n\n＋그룹은 후보를 담는 상자이고, 카드는 그 안에 들어가는 실제 태그입니다.\n\n프롬프트에 `..1..`을 넣으면, 생성할 때 1번 그룹의 카드 중 하나가 그 자리에 자동으로 들어갑니다.\n\n와일드카드를 잠시 쓰지 않으려면 적용 ON/OFF를 끄면 됩니다.',
+        text:'이 화면에서 후보 목록을 만들어 둡니다.\n\n＋그룹은 후보를 담는 상자이고, 카드는 그 안에 들어가는 실제 태그입니다.\n\n프롬프트에 `..1..`을 넣으면, 생성할 때 1번 그룹의 카드 중 하나가 그 자리에 자동으로 들어갑니다.\n\n각 후보 줄 끝에는 `[slots:1=...|2=...]` 를 붙여서, 그 줄이 뽑혔을 때 C1~C6 프롬프트에만 임시 태그를 함께 보낼 수도 있습니다.\n\n와일드카드를 잠시 쓰지 않으려면 적용 ON/OFF를 끄면 됩니다.',
         before:function(){ actMain('extras'); setTimeout(function(){ if(NAIM.tour && NAIM.tour.active) NAIM.tour.reposition(); }, 120); }
       },
       {
@@ -20310,7 +20491,7 @@ body.tour-mob #tourNavBtns{display:none;}
       { key:'deck.apply', sel:'#wildcardApplyToggle', title:'와일드카드 켜고 끄기', before:toDeckReflow,
         text:'적용 ON/OFF로 와일드카드 사용 여부를 바꿀 수 있습니다.\n\nOFF로 두면 프롬프트에 토큰이 있어도 와일드카드가 동작하지 않습니다.\n\n같은 프롬프트로 고정해서 만들고 싶을 때는 OFF로 두면 됩니다.' },
       { target:'nw-card-list', title:'카드 추가와 편집', before:toDeckReflow,
-        text:'카드 목록 맨 끝의 점선 ＋ 칸을 누르면 나만의 카드를 만들 수 있습니다.\n\n아이콘과 분류를 고르고, 사용할 태그를 한 줄에 하나씩 적으면 됩니다.\n\n이미 있는 카드도 수정할 수 있습니다. PC에서는 카드를 마우스 오른쪽 클릭, 모바일에서는 길게 누르면 편집 창이 열립니다.\n\n이제 기본 카드와 사용자 카드가 따로 구분되지 않습니다. 수정하면 해당 카드 내용이 바뀌고, 삭제하면 새로고침해도 다시 돌아오지 않습니다. 중요한 카드는 데이터관리에서 먼저 백업해두는 것이 좋습니다.' }
+        text:'카드 목록 맨 끝의 점선 ＋ 칸을 누르면 나만의 카드를 만들 수 있습니다.\n\n아이콘과 분류를 고르고, 사용할 태그를 한 줄에 하나씩 적으면 됩니다.\n\n베이스 문장 뒤에 `[slots:1=tag a|2=tag b]` 형식을 붙이면, 그 줄이 뽑혔을 때 해당 캐릭터 슬롯 프롬프트에 태그가 함께 추가됩니다.\n\n이미 있는 카드도 수정할 수 있습니다. PC에서는 카드를 마우스 오른쪽 클릭, 모바일에서는 길게 누르면 편집 창이 열립니다.\n\n이제 기본 카드와 사용자 카드가 따로 구분되지 않습니다. 수정하면 해당 카드 내용이 바뀌고, 삭제하면 새로고침해도 다시 돌아오지 않습니다. 중요한 카드는 데이터관리에서 먼저 백업해두는 것이 좋습니다.' }
     ];
   }
   function startDeckTour(){ start(deckTourSteps(), {}); }
